@@ -70,10 +70,21 @@ def nested_optimize_audited(
                 f"Grouped CV leakage detected in outer fold {fold}: {sorted(overlap)[:5]}"
             )
 
-        inner_group_count = len(np.unique(groups[train]))
-        inner_n = min(int(inner_folds), inner_group_count)
+        inner_support = (
+            pd.DataFrame({"class": y[train].astype(str), "group": groups[train].astype(str)})
+            .drop_duplicates()
+            .groupby("class")
+            .size()
+        )
+        if inner_support.empty:
+            raise ValueError(f"Outer fold {fold} has no class/group support for inner CV.")
+        inner_n = min(int(inner_folds), int(inner_support.min()))
         if inner_n < 2:
-            raise ValueError(f"Outer fold {fold} leaves fewer than two groups for inner CV.")
+            limiting = ", ".join(f"{label}={count}" for label, count in inner_support.items())
+            raise ValueError(
+                f"Outer fold {fold} leaves fewer than two independent groups in at least one class for inner CV ({limiting}). "
+                "Use fewer outer folds, collect more independent groups, or treat the supervised result as unsupported."
+            )
         inner = StratifiedGroupKFold(inner_n, shuffle=True, random_state=1000 + int(seed) + fold)
 
         steps, params, fold_history = core.search(
@@ -128,6 +139,8 @@ def nested_optimize_audited(
             "inner_outer_gap": inner_bal - test_bal,
             "train_group_count": len(train_groups),
             "test_group_count": len(test_groups),
+            "minimum_inner_groups_per_class": int(inner_support.min()),
+            "inner_folds_used": int(inner_n),
             "group_overlap_count": 0,
         })
         for idx in train:
@@ -170,7 +183,7 @@ def nested_optimize_audited(
         f"{float(fold_table.outer_balanced_accuracy.std(ddof=1)) if len(fold_table) > 1 else 0.0:.3f}. "
         f"Training balanced accuracy averages {mean_train:.3f}, giving a training-to-outer gap of {gap:.3f} ({overfit} overfitting warning). "
         f"Worst outer fold={float(fold_table.outer_balanced_accuracy.min()):.3f}; best={float(fold_table.outer_balanced_accuracy.max()):.3f}. "
-        "Every outer test group is disjoint from its training groups, and all reported predictions are out-of-fold."
+        "Every outer test group is disjoint from its training groups, all learned preprocessing/model steps are fitted inside the training side of each split, and all reported predictions are out-of-fold."
     )
 
     return {
