@@ -99,5 +99,16 @@ def test_audited_nested_cv_has_no_group_leakage_and_oof_alignment():
         train_groups = set(block.loc[block.role == "train", "group"])
         test_groups = set(block.loc[block.role == "test", "group"])
         assert not train_groups.intersection(test_groups)
+
+    # With three trials the deterministic search evaluates one candidate from each
+    # model family, so all three can be compared on exactly the same outer folds.
+    family = result["model_family_folds"]
+    assert set(family.model) == {"SVM", "Random Forest", "PLS-DA"}
+    for fold in result["folds"].fold:
+        block = family.loc[family.fold == fold]
+        assert set(block.model) == {"SVM", "Random Forest", "PLS-DA"}
+    assert set(result["model_family_summary"].model) == {"SVM", "Random Forest", "PLS-DA"}
+    assert len(result["model_family_oof_predictions"]) == len(X) * 3
+
     assert np.isfinite(result["train_validation_gap"])
     assert result["overfitting_level"] in {"low", "moderate", "high"}
