@@ -233,6 +233,9 @@ def _write_predictive_exports(window):
         ("splits", "validation_split_audit.csv"),
         ("specificity", "per_class_sensitivity_specificity.csv"),
         ("best", "outer_fold_selected_models.csv"),
+        ("model_family_folds", "model_family_outer_fold_metrics.csv"),
+        ("model_family_summary", "model_family_outer_comparison.csv"),
+        ("model_family_oof_predictions", "model_family_out_of_fold_predictions.csv"),
     ):
         value = result.get(key)
         if isinstance(value, pd.DataFrame):
@@ -463,6 +466,27 @@ def install_gui_extensions(app_ui):
 
     def enhanced_render_review(self):
         original_render_review(self)
+
+        # Replace the old inner-trial-only boxplot with a fair model-family comparison
+        # whenever audited outer-fold family metrics are available. Each family is
+        # tuned inside the same outer-training data and evaluated on identical held-out folds.
+        if getattr(self, "opt", None):
+            result = self.opt[0]
+            family = result.get("model_family_folds")
+            if isinstance(family, pd.DataFrame) and not family.empty:
+                self.model_compare.fig.clear()
+                ax = self.model_compare.fig.add_subplot()
+                family.boxplot(
+                    column="outer_balanced_accuracy",
+                    by="model",
+                    ax=ax,
+                )
+                self.model_compare.fig.suptitle("")
+                ax.set_title("Model families · same outer held-out folds")
+                ax.set_xlabel("Model family")
+                ax.set_ylabel("Outer held-out balanced accuracy")
+                self.model_compare.draw()
+
         _populate_health_workspace(self)
         try:
             _write_predictive_exports(self)
