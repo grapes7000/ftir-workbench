@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import linkage
 from scipy.signal import savgol_filter
-from scipy.stats import f as f_distribution
+from scipy.stats import f as f_distribution, norm as normal_distribution
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.cluster import AgglomerativeClustering, DBSCAN, KMeans
 from sklearn.decomposition import PCA
@@ -308,6 +308,7 @@ def pca_cv(X, steps, max_components=30, folds=5, groups=None, wn=None):
         splitter = KFold(n_splits, shuffle=True, random_state=42)
         splits = list(splitter.split(X))
 
+    nmax = min(nmax, min(len(train) - 1 for train, _ in splits))
     fold_metrics = {n: {"cal": [], "val": [], "press": [], "tss": []} for n in range(1, nmax + 1)}
     for train, test in splits:
         prep = RecipeTransformer(steps, wn=wn).fit(X[train])
@@ -445,7 +446,6 @@ def _value_role_scores(series: pd.Series) -> dict[str, float]:
     if unique_ratio > 0.85 and unique >= max(5, int(n * 0.5)):
         scores["sample_id"] = max(scores.get("sample_id", 0), 0.48)
 
-    # Date parsing is intentionally conservative so ordinary labels are not mistaken for dates.
     if n >= 3 and text.str.match(r"^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}").mean() > 0.5:
         parsed = pd.to_datetime(text, errors="coerce")
         if float(parsed.notna().mean()) > 0.8:
@@ -457,7 +457,6 @@ def _value_role_scores(series: pd.Series) -> dict[str, float]:
 
 
 def infer_metadata_schema(meta: pd.DataFrame) -> pd.DataFrame:
-    """Infer semantic metadata roles from both headers and observed values."""
     rows = []
     for column in meta.columns:
         series = meta[column]
@@ -468,7 +467,6 @@ def infer_metadata_schema(meta: pd.DataFrame) -> pd.DataFrame:
                 continue
             header_score = _header_role_score(column, role)
             value_score = value_scores.get(role, 0.0)
-            # Header semantics are strongest; compatible values increase confidence.
             role_scores[role] = min(0.99, max(header_score, value_score, header_score + 0.12 * value_score))
 
         role, confidence = max(role_scores.items(), key=lambda item: item[1]) if role_scores else ("other", 0.0)
@@ -518,7 +516,6 @@ def suggest_label_column(meta: pd.DataFrame, schema: pd.DataFrame | None = None)
             if 2 <= nunique <= max(50, len(meta) // 2) and (counts >= 2).sum() >= 2:
                 return column
 
-    # Fallback to a sensible categorical metadata column.
     for column in meta.columns:
         nunique = meta[column].nunique(dropna=True)
         if 2 <= nunique <= min(30, max(2, len(meta) // 2)):
@@ -579,7 +576,6 @@ def eligibility(meta, label, cols, min_groups):
 
 
 def suggest_savgol_window(n_features: int) -> int:
-    """Choose a conservative odd SG window from spectral resolution, not a magic constant."""
     if n_features < 7:
         return max(3, n_features if n_features % 2 else n_features - 1)
     target = max(7, min(31, int(round(n_features * 0.015))))
@@ -593,40 +589,19 @@ def _candidate_recipes(wn, n_features):
     minimum, maximum = float(np.nanmin(wn)), float(np.nanmax(wn))
     range_step = Step("Range", {"minimum": minimum, "maximum": maximum})
     return [
-        (
-            "Mean-centered",
-            [copy.deepcopy(range_step), Step("Mean center", {})],
-        ),
-        (
-            "SNV",
-            [copy.deepcopy(range_step), Step("SNV", {}), Step("Mean center", {})],
-        ),
+        ("Mean-centered", [copy.deepcopy(range_step), Step("Mean center", {})]),
+        ("SNV", [copy.deepcopy(range_step), Step("SNV", {}), Step("Mean center", {})]),
         (
             "Smoothed + SNV",
-            [
-                copy.deepcopy(range_step),
-                Step("Savitzky-Golay", {"window": window, "poly": 2}),
-                Step("SNV", {}),
-                Step("Mean center", {}),
-            ],
+            [copy.deepcopy(range_step), Step("Savitzky-Golay", {"window": window, "poly": 2}), Step("SNV", {}), Step("Mean center", {})],
         ),
         (
             "1st derivative + SNV",
-            [
-                copy.deepcopy(range_step),
-                Step("Derivative", {"order": 1, "window": window, "poly": 2}),
-                Step("SNV", {}),
-                Step("Mean center", {}),
-            ],
+            [copy.deepcopy(range_step), Step("Derivative", {"order": 1, "window": window, "poly": 2}), Step("SNV", {}), Step("Mean center", {})],
         ),
         (
             "Baseline + SNV",
-            [
-                copy.deepcopy(range_step),
-                Step("Baseline polynomial", {"order": 2}),
-                Step("SNV", {}),
-                Step("Mean center", {}),
-            ],
+            [copy.deepcopy(range_step), Step("Baseline polynomial", {"order": 2}), Step("SNV", {}), Step("Mean center", {})],
         ),
     ]
 
@@ -643,7 +618,6 @@ def compare_pca_recipes(X, wn, meta=None, max_components=20, folds=4):
         selected_row = cv.loc[cv.components == best].iloc[0]
         q2 = float(selected_row.Q2_X)
         rmsecv = float(selected_row.RMSECV_X)
-        # Favor predictive reconstruction while mildly preferring simpler preprocessing.
         objective = (q2 if np.isfinite(q2) else -1e9) - 0.008 * (complexity - 1)
         row = {
             "name": name,
@@ -654,16 +628,7 @@ def compare_pca_recipes(X, wn, meta=None, max_components=20, folds=4):
             "objective": float(objective),
         }
         rows.append(row)
-        results.append(
-            {
-                "name": name,
-                "steps": steps,
-                "cv": cv,
-                "best_components": int(best),
-                "pca_result": fitted,
-                **row,
-            }
-        )
+        results.append({"name": name, "steps": steps, "cv": cv, "best_components": int(best), "pca_result": fitted, **row})
     summary = pd.DataFrame(rows).sort_values("objective", ascending=False).reset_index(drop=True)
     order = list(summary.name)
     results = sorted(results, key=lambda r: order.index(r["name"]))
@@ -683,14 +648,28 @@ def pca_diagnostics(pca_result, alpha=0.95):
 
     n, a = scores.shape
     if n > a:
-        t2_limit = float(
-            (a * (n - 1) / (n - a))
-            * f_distribution.ppf(alpha, a, n - a)
-        )
+        t2_limit = float((a * (n - 1) / (n - a)) * f_distribution.ppf(alpha, a, n - a))
     else:
         t2_limit = float(np.quantile(t2, alpha))
-    # Empirical residual limit is intentionally transparent and robust for guided use.
-    q_limit = float(np.quantile(q, alpha))
+
+    full_rank = min(len(processed) - 1, processed.shape[1])
+    full_eigenvalues = PCA(full_rank, svd_solver="full").fit(processed).explained_variance_
+    residual_eigenvalues = np.asarray(full_eigenvalues[len(eigenvalues):], dtype=float)
+    residual_eigenvalues = residual_eigenvalues[residual_eigenvalues > 1e-15]
+    if len(residual_eigenvalues):
+        theta1 = float(np.sum(residual_eigenvalues))
+        theta2 = float(np.sum(residual_eigenvalues**2))
+        theta3 = float(np.sum(residual_eigenvalues**3))
+        if theta1 > 0 and theta2 > 0:
+            h0 = 1 - (2 * theta1 * theta3) / (3 * theta2**2)
+            h0 = max(h0, 1e-6)
+            z_alpha = float(normal_distribution.ppf(alpha))
+            bracket = z_alpha * math.sqrt(2 * theta2 * h0**2) / theta1 + 1 + theta2 * h0 * (h0 - 1) / (theta1**2)
+            q_limit = float(theta1 * max(bracket, 1e-12) ** (1 / h0))
+        else:
+            q_limit = float(np.quantile(q, alpha))
+    else:
+        q_limit = float(np.quantile(q, alpha))
 
     table = pd.DataFrame(
         {
@@ -702,14 +681,7 @@ def pca_diagnostics(pca_result, alpha=0.95):
         }
     )
     table["review_flag"] = table.T2_flag | table.Q_flag
-    return {
-        "table": table,
-        "t2_limit": t2_limit,
-        "q_limit": q_limit,
-        "residuals": residuals,
-        "reconstructed": reconstructed,
-        "alpha": alpha,
-    }
+    return {"table": table, "t2_limit": t2_limit, "q_limit": q_limit, "residuals": residuals, "reconstructed": reconstructed, "alpha": alpha}
 
 
 def sample_contributions(pca_result, sample_index):
@@ -752,7 +724,6 @@ def _silhouette_quality(value: float) -> str:
 
 
 def analyze_clustering(z, max_k=8):
-    """Benchmark clustering choices and return a plain-English interpretation."""
     z = np.asarray(z, dtype=float)
     n = len(z)
     if n < 4:
@@ -768,12 +739,10 @@ def analyze_clustering(z, max_k=8):
         km_sil = float(silhouette_score(z, km))
         ag_sil = float(silhouette_score(z, ag))
         agreement = float(adjusted_rand_score(km, ag))
-        rows.extend(
-            [
-                {"method": "KMeans", "k": k, "silhouette": km_sil, "coverage": 1.0, "agreement": agreement},
-                {"method": "Agglomerative", "k": k, "silhouette": ag_sil, "coverage": 1.0, "agreement": agreement},
-            ]
-        )
+        rows.extend([
+            {"method": "KMeans", "k": k, "silhouette": km_sil, "coverage": 1.0, "agreement": agreement},
+            {"method": "Agglomerative", "k": k, "silhouette": ag_sil, "coverage": 1.0, "agreement": agreement},
+        ])
         labels_by_key[("KMeans", k)] = km
         labels_by_key[("Agglomerative", k)] = ag
 
@@ -789,37 +758,20 @@ def analyze_clustering(z, max_k=8):
         if len(cluster_ids) >= 2 and non_noise.sum() > len(cluster_ids):
             sil = float(silhouette_score(z[non_noise], labels[non_noise]))
             score = sil * coverage
-            rows.append(
-                {
-                    "method": "DBSCAN",
-                    "k": len(cluster_ids),
-                    "silhouette": sil,
-                    "coverage": coverage,
-                    "agreement": np.nan,
-                    "eps": eps,
-                    "min_samples": nn,
-                    "selection_score": score,
-                }
-            )
+            rows.append({"method": "DBSCAN", "k": len(cluster_ids), "silhouette": sil, "coverage": coverage, "agreement": np.nan, "eps": eps, "min_samples": nn, "selection_score": score})
             labels_by_key[("DBSCAN", quantile)] = labels
 
     table = pd.DataFrame(rows)
     if "selection_score" not in table:
         table["selection_score"] = np.nan
     standard = table.method != "DBSCAN"
-    table.loc[standard, "selection_score"] = (
-        table.loc[standard, "silhouette"] - 0.01 * (table.loc[standard, "k"] - 2)
-    )
+    table.loc[standard, "selection_score"] = table.loc[standard, "silhouette"] - 0.01 * (table.loc[standard, "k"] - 2)
 
     best_row = table.loc[table.selection_score.idxmax()]
     method = str(best_row.method)
     if method == "DBSCAN":
-        # Find the nearest matching DBSCAN labels.
         target_eps = float(best_row.eps)
-        best_key = min(
-            [key for key in labels_by_key if key[0] == "DBSCAN"],
-            key=lambda key: abs(float(np.quantile(kth, key[1])) - target_eps),
-        )
+        best_key = min([key for key in labels_by_key if key[0] == "DBSCAN"], key=lambda key: abs(float(np.quantile(kth, key[1])) - target_eps))
     else:
         best_key = (method, int(best_row.k))
     best_labels = labels_by_key[best_key]
@@ -828,67 +780,35 @@ def analyze_clustering(z, max_k=8):
     noise = int((best_labels == -1).sum())
     best_silhouette = float(best_row.silhouette)
     quality = _silhouette_quality(best_silhouette)
-
-    # Agreement is most meaningful between KMeans and Ward at the selected k.
     k_for_agreement = int(best_row.k)
     if ("KMeans", k_for_agreement) in labels_by_key and ("Agglomerative", k_for_agreement) in labels_by_key:
-        agreement = float(
-            adjusted_rand_score(
-                labels_by_key[("KMeans", k_for_agreement)],
-                labels_by_key[("Agglomerative", k_for_agreement)],
-            )
-        )
+        agreement = float(adjusted_rand_score(labels_by_key[("KMeans", k_for_agreement)], labels_by_key[("Agglomerative", k_for_agreement)]))
     else:
         agreement = np.nan
 
     if np.isfinite(agreement):
-        agreement_phrase = (
-            "The two conventional clustering methods agree strongly."
-            if agreement >= 0.75
-            else "The two conventional clustering methods show partial agreement."
-            if agreement >= 0.4
-            else "Different clustering methods disagree, so the cluster structure should be treated cautiously."
-        )
+        agreement_phrase = "The two conventional clustering methods agree strongly." if agreement >= 0.75 else "The two conventional clustering methods show partial agreement." if agreement >= 0.4 else "Different clustering methods disagree, so the cluster structure should be treated cautiously."
     else:
         agreement_phrase = "Agreement between conventional methods is not available for this choice."
 
     cluster_sizes = ", ".join(f"{int(idx)}: {int(value)}" for idx, value in counts.items())
-    report = (
-        f"Recommended clustering: {method}"
-        + (f" with {int(best_row.k)} clusters" if method != "DBSCAN" else "")
-        + f". The separation is {quality} (silhouette {best_silhouette:.3f}). "
-        f"{agreement_phrase} "
-        f"Cluster sizes are {cluster_sizes or 'not available'}."
-    )
+    report = f"Recommended clustering: {method}" + (f" with {int(best_row.k)} clusters" if method != "DBSCAN" else "") + f". The separation is {quality} (silhouette {best_silhouette:.3f}). {agreement_phrase} Cluster sizes are {cluster_sizes or 'not available'}."
     if noise:
         report += f" DBSCAN-style noise detection marks {noise} sample(s) as outside dense groups."
     if quality == "weak":
         report += " The data may form a continuum rather than cleanly separated groups; do not over-interpret cluster names."
 
-    return {
-        "table": table.sort_values("selection_score", ascending=False).reset_index(drop=True),
-        "best_method": method,
-        "best_labels": np.asarray(best_labels),
-        "best_params": best_row.to_dict(),
-        "report": report,
-        "linkage": linkage(z, method="ward"),
-        "agreement_ari": agreement,
-    }
+    return {"table": table.sort_values("selection_score", ascending=False).reset_index(drop=True), "best_method": method, "best_labels": np.asarray(best_labels), "best_params": best_row.to_dict(), "report": report, "linkage": linkage(z, method="ward"), "agreement_ari": agreement}
 
 
 def guided_analysis(X, wn, meta, max_components=20):
-    """Run the non-expert workflow and return choices plus human-readable reasoning."""
     schema = infer_metadata_schema(meta)
     label = suggest_label_column(meta, schema)
     groups = suggest_group_columns(meta, schema)
-
-    comparisons, comparison_table = compare_pca_recipes(
-        X, wn, meta=meta, max_components=max_components
-    )
+    comparisons, comparison_table = compare_pca_recipes(X, wn, meta=meta, max_components=max_components)
     selected = comparisons[0]
     pca_result = selected["pca_result"]
     diagnostics = pca_diagnostics(pca_result)
-
     cluster_pcs = max(2, min(selected["best_components"], pca_result["scores"].shape[1], 10))
     clustering = analyze_clustering(pca_result["scores"][:, :cluster_pcs])
 
@@ -898,51 +818,17 @@ def guided_analysis(X, wn, meta, max_components=20):
     label_text = f"'{label}'" if label else "no reliable prediction label"
     group_text = ", ".join(groups) if groups else "no independent grouping field was confidently detected"
 
-    report = (
-        f"Guided analysis selected {selected['name']} preprocessing and "
-        f"{selected['best_components']} PCA component(s). "
-        f"The cross-validated reconstruction Q²-X is {q2:.3f}. "
-        f"{flagged} of {total} sample(s) are flagged for review by the PCA diagnostics. "
-        f"{clustering['report']} "
-        f"For predictive modeling, the best automatic label suggestion is {label_text}; "
-        f"grouping suggestion: {group_text}. "
-        "These are recommendations, not proof of sample identity or class membership."
-    )
+    report = f"Guided analysis selected {selected['name']} preprocessing and {selected['best_components']} PCA component(s). The cross-validated reconstruction Q²-X is {q2:.3f}. {flagged} of {total} sample(s) are flagged for review by the PCA diagnostics. {clustering['report']} For predictive modeling, the best automatic label suggestion is {label_text}; grouping suggestion: {group_text}. These are recommendations, not proof of sample identity or class membership."
 
-    return {
-        "schema": schema,
-        "suggested_label": label,
-        "suggested_groups": groups,
-        "comparisons": comparisons,
-        "comparison_table": comparison_table,
-        "selected": selected,
-        "pca_result": pca_result,
-        "diagnostics": diagnostics,
-        "clustering": clustering,
-        "report": report,
-        "cluster_pcs": cluster_pcs,
-    }
+    return {"schema": schema, "suggested_label": label, "suggested_groups": groups, "comparisons": comparisons, "comparison_table": comparison_table, "selected": selected, "pca_result": pca_result, "diagnostics": diagnostics, "clustering": clustering, "report": report, "cluster_pcs": cluster_pcs}
 
 
 def _ordered_steps(steps):
-    stages = {
-        "Range": 0,
-        "Exclude": 1,
-        "Baseline polynomial": 2,
-        "Savitzky-Golay": 3,
-        "Derivative": 4,
-        "SNV": 5,
-        "Vector normalize": 5,
-        "Area normalize": 5,
-        "Mean center": 6,
-        "Autoscale": 6,
-        "Robust scale": 6,
-    }
+    stages = {"Range": 0, "Exclude": 1, "Baseline polynomial": 2, "Savitzky-Golay": 3, "Derivative": 4, "SNV": 5, "Vector normalize": 5, "Area normalize": 5, "Mean center": 6, "Autoscale": 6, "Robust scale": 6}
     return sorted(copy.deepcopy(steps), key=lambda step: stages.get(step.name, 99))
 
 
 def candidate(rng, maxpcs, base):
-    """Generate only chemically sensible candidates; do not randomly scramble preprocessing order."""
     steps = _ordered_steps(base)
     for step in steps:
         if step.name in ("Savitzky-Golay", "Derivative"):
@@ -951,24 +837,12 @@ def candidate(rng, maxpcs, base):
             step.params["order"] = int(rng.integers(1, 3))
 
     model = ["SVM", "Random Forest"][int(rng.integers(2))]
-    params = {
-        "model": model,
-        "use_pca": bool(rng.integers(2)),
-        "pcs": int(rng.integers(2, max(3, maxpcs + 1))),
-    }
+    params = {"model": model, "use_pca": bool(rng.integers(2)), "pcs": int(rng.integers(2, max(3, maxpcs + 1)))}
     if model == "SVM":
         gamma_options = ["scale", 0.001, 0.01, 0.1]
-        params.update(
-            C=float(10 ** rng.uniform(-2, 2)),
-            kernel=["linear", "rbf"][int(rng.integers(2))],
-            gamma=gamma_options[int(rng.integers(len(gamma_options)))],
-        )
+        params.update(C=float(10 ** rng.uniform(-2, 2)), kernel=["linear", "rbf"][int(rng.integers(2))], gamma=gamma_options[int(rng.integers(len(gamma_options)))])
     else:
-        params.update(
-            trees=[200, 400][int(rng.integers(2))],
-            depth=[None, 5, 10, 20][int(rng.integers(4))],
-            leaf=int(rng.integers(1, 5)),
-        )
+        params.update(trees=[200, 400][int(rng.integers(2))], depth=[None, 5, 10, 20][int(rng.integers(4))], leaf=int(rng.integers(1, 5)))
     return steps, params
 
 
@@ -977,25 +851,11 @@ def pipe(steps, params, max_pc_fit=None, wn=None):
     if params["model"] == "SVM":
         chain.append(("scale", StandardScaler()))
     if params["use_pca"]:
-        chain.append(
-            ("pca", PCA(params["pcs"], svd_solver="randomized", random_state=42))
-        )
+        chain.append(("pca", PCA(params["pcs"], svd_solver="randomized", random_state=42)))
     if params["model"] == "SVM":
-        classifier = SVC(
-            C=params["C"],
-            kernel=params["kernel"],
-            gamma=params["gamma"],
-            class_weight="balanced",
-        )
+        classifier = SVC(C=params["C"], kernel=params["kernel"], gamma=params["gamma"], class_weight="balanced")
     else:
-        classifier = RandomForestClassifier(
-            n_estimators=params["trees"],
-            max_depth=params["depth"],
-            min_samples_leaf=params["leaf"],
-            class_weight="balanced",
-            n_jobs=1,
-            random_state=42,
-        )
+        classifier = RandomForestClassifier(n_estimators=params["trees"], max_depth=params["depth"], min_samples_leaf=params["leaf"], class_weight="balanced", n_jobs=1, random_state=42)
     chain.append(("clf", classifier))
     return Pipeline(chain)
 
@@ -1004,109 +864,39 @@ def search(X, y, groups, base, trials, maxpcs, cv, seed, wn=None):
     rng = np.random.default_rng(seed)
     history = []
     best = None
-
     for trial in range(trials):
         steps, params = candidate(rng, maxpcs, base)
         try:
-            values = cross_val_score(
-                pipe(steps, params, wn=wn),
-                X,
-                y,
-                groups=groups,
-                cv=cv,
-                scoring="balanced_accuracy",
-                error_score="raise",
-                n_jobs=1,
-            )
+            values = cross_val_score(pipe(steps, params, wn=wn), X, y, groups=groups, cv=cv, scoring="balanced_accuracy", error_score="raise", n_jobs=1)
             score = float(values.mean())
             std = float(values.std())
             objective = score - 0.25 * std - 0.002 * (params["pcs"] if params["use_pca"] else 0)
-            history.append(
-                {
-                    "trial": trial,
-                    "status": "complete",
-                    "score": score,
-                    "std": std,
-                    "objective": objective,
-                    "recipe": json.dumps([asdict(step) for step in steps]),
-                    **params,
-                }
-            )
+            history.append({"trial": trial, "status": "complete", "score": score, "std": std, "objective": objective, "recipe": json.dumps([asdict(step) for step in steps]), **params})
             if best is None or objective > best[0]:
                 best = (objective, steps, params)
         except Exception as exc:
-            history.append(
-                {
-                    "trial": trial,
-                    "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "recipe": json.dumps([asdict(step) for step in steps]),
-                    **params,
-                }
-            )
-
+            history.append({"trial": trial, "status": "failed", "error": f"{type(exc).__name__}: {exc}", "recipe": json.dumps([asdict(step) for step in steps]), **params})
     if best is None:
         raise RuntimeError("All optimization trials failed.")
     return best[1], best[2], pd.DataFrame(history)
 
 
-def nested_optimize(
-    X,
-    y,
-    groups,
-    base,
-    trials=20,
-    maxpcs=20,
-    outer_folds=3,
-    inner_folds=2,
-    wn=None,
-):
+def nested_optimize(X, y, groups, base, trials=20, maxpcs=20, outer_folds=3, inner_folds=2, wn=None):
     outer = StratifiedGroupKFold(outer_folds, shuffle=True, random_state=42)
     predictions = np.empty(len(y), dtype=object)
     folds = []
     history = []
     best_rows = []
-
     for fold, (train, test) in enumerate(outer.split(X, y, groups), 1):
         inner = StratifiedGroupKFold(inner_folds, shuffle=True, random_state=100 + fold)
-        steps, params, fold_history = search(
-            X[train],
-            y[train],
-            groups[train],
-            base,
-            trials,
-            min(maxpcs, len(train) - 1),
-            inner,
-            200 + fold,
-            wn=wn,
-        )
+        steps, params, fold_history = search(X[train], y[train], groups[train], base, trials, min(maxpcs, len(train) - 1), inner, 200 + fold, wn=wn)
         model = pipe(steps, params, wn=wn).fit(X[train], y[train])
         pred = model.predict(X[test])
         predictions[test] = pred
         fold_history["outer_fold"] = fold
         history.append(fold_history)
-        best_rows.append(
-            {"fold": fold, "recipe": json.dumps([asdict(step) for step in steps]), **params}
-        )
-        folds.append(
-            {
-                "fold": fold,
-                "balanced_accuracy": balanced_accuracy_score(y[test], pred),
-                "macro_f1": f1_score(y[test], pred, average="macro", zero_division=0),
-            }
-        )
+        best_rows.append({"fold": fold, "recipe": json.dumps([asdict(step) for step in steps]), **params})
+        folds.append({"fold": fold, "balanced_accuracy": balanced_accuracy_score(y[test], pred), "macro_f1": f1_score(y[test], pred, average="macro", zero_division=0)})
 
     classes = np.unique(y)
-    return {
-        "pred": predictions,
-        "folds": pd.DataFrame(folds),
-        "history": pd.concat(history, ignore_index=True),
-        "best": pd.DataFrame(best_rows),
-        "classes": classes,
-        "cm": confusion_matrix(y, predictions, labels=classes),
-        "report": pd.DataFrame(
-            classification_report(y, predictions, output_dict=True, zero_division=0)
-        ).T,
-        "balanced_accuracy": balanced_accuracy_score(y, predictions),
-        "macro_f1": f1_score(y, predictions, average="macro", zero_division=0),
-    }
+    return {"pred": predictions, "folds": pd.DataFrame(folds), "history": pd.concat(history, ignore_index=True), "best": pd.DataFrame(best_rows), "classes": classes, "cm": confusion_matrix(y, predictions, labels=classes), "report": pd.DataFrame(classification_report(y, predictions, output_dict=True, zero_division=0)).T, "balanced_accuracy": balanced_accuracy_score(y, predictions), "macro_f1": f1_score(y, predictions, average="macro", zero_division=0)}
