@@ -2,8 +2,8 @@ from __future__ import annotations
 
 """Pure helpers for rebuilding Model Review trial projections.
 
-The GUI slider calls these functions so each slider position is derived from that
-history row's stored preprocessing recipe and PCA flag. No stale global PCA is used.
+This module also wires the new transparent scientific audit and audited nested-CV
+implementation into the existing v5.2 workflow without changing the public GUI API.
 """
 
 import json
@@ -12,6 +12,9 @@ import numpy as np
 import pandas as pd
 
 import core
+import scientific_analysis
+import transparent_guided
+import validation_audit
 
 
 def _record(row):
@@ -91,3 +94,47 @@ def trial_projection(X, wn, row, max_display_components=3):
         "display_only": display_only,
         "uses_model_pca": use_pca,
     }
+
+
+# --- Workflow integration -------------------------------------------------
+# app.py imports review_tools before it runs any analysis.  We use that stable import
+# point to enrich Guided Analysis and replace the older nested-CV routine while
+# keeping app_ui.py backward-compatible.
+_original_guided_analysis = transparent_guided.guided_analysis
+
+
+def guided_analysis_with_scientific_audit(X, wn, meta, max_components=20):
+    result = _original_guided_analysis(X, wn, meta, max_components=max_components)
+    science = scientific_analysis.comprehensive_analysis(
+        X, wn, meta, result, n_resamples=8
+    )
+    result["scientific"] = science
+    result["report"] = (
+        science["report"]
+        + "\n\nDETAILED GUIDED-SELECTION AUDIT\n"
+        + result["report"]
+    )
+    return result
+
+
+def nested_optimize_compatible(*args, **kwargs):
+    result = validation_audit.nested_optimize_audited(*args, **kwargs)
+    # Existing plots expect these legacy names. They are aliases of OUTER held-out
+    # metrics, not training metrics.
+    result["folds"] = result["folds"].copy()
+    result["folds"]["balanced_accuracy"] = result["folds"]["outer_balanced_accuracy"]
+    result["folds"]["macro_f1"] = result["folds"]["outer_macro_f1"]
+    # Surface validation evidence in the optimization history so the trial browser
+    # shows the outer-fold context rather than only an inner-CV score.
+    by_fold = result["folds"].set_index("fold")
+    history = result["history"].copy()
+    history["outer_balanced_accuracy"] = history.outer_fold.map(by_fold.outer_balanced_accuracy)
+    history["outer_macro_f1"] = history.outer_fold.map(by_fold.outer_macro_f1)
+    history["outer_train_validation_gap"] = history.outer_fold.map(by_fold.train_outer_gap)
+    result["history"] = history
+    return result
+
+
+transparent_guided.guided_analysis = guided_analysis_with_scientific_audit
+core.guided_analysis = guided_analysis_with_scientific_audit
+core.nested_optimize = nested_optimize_compatible
