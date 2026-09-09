@@ -10,13 +10,15 @@ import pandas as pd
 
 import core
 import transparent_guided
-from review_tools import trial_projection
+from review_tools import install_gui_extensions, trial_projection
 from spectral_constraints import apply_hard_exclusion, describe_exclusion
 
 core.compare_pca_recipes = transparent_guided.compare_pca_recipes
 core.guided_analysis = transparent_guided.guided_analysis
 
 import app_ui
+
+install_gui_extensions(app_ui)
 
 
 class Main(app_ui.Main):
