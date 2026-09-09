@@ -3,9 +3,9 @@ from __future__ import annotations
 """Model-review helpers and v5.2 science-workflow integration.
 
 The trial slider is rebuilt from each history row's stored recipe/PCA settings.
-This module also installs the transparent scientific-audit workspace into the
-existing PySide6 base UI at import time so the application structure can remain
-stable while the analysis logic stays modular.
+Scientific helpers remain importable in headless test environments; the desktop
+launcher explicitly installs the optional PySide6 Model Health workspace only
+after the GUI module is available.
 """
 
 from dataclasses import asdict
@@ -363,9 +363,8 @@ def _run_permutation_test(window):
             window.permutation_button.setEnabled(True)
 
 
-def _install_gui_extensions():
-    import app_ui
-
+def install_gui_extensions(app_ui):
+    """Install the Model Health workspace after the Qt UI module is already loaded."""
     if getattr(app_ui.Main, "_science_extensions_installed", False):
         return
 
@@ -477,6 +476,3 @@ def _install_gui_extensions():
     app_ui.Main.render_guided = enhanced_render_guided
     app_ui.Main.render_review = enhanced_render_review
     app_ui.Main._science_extensions_installed = True
-
-
-_install_gui_extensions()
