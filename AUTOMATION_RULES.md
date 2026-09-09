@@ -2,6 +2,27 @@
 
 The v5.2 automatic PCA workflow is intentionally rule-based. There is no hidden machine-learning model choosing preprocessing settings.
 
+## Hard spectral exclusions
+
+A **hard spectral exclusion** is a user constraint, not an optimization candidate.
+
+The default UI value is `500-1000 cm⁻¹` because this project commonly treats that region as a solvent/interference region. The field is editable and can contain multiple ranges, for example:
+
+`500-1000, 2350-2450`
+
+When a hard exclusion is active, those spectral variables are physically removed from the matrix and wavenumber axis **before** any of these paths receive the data:
+
+- Guided Analysis PCA candidates
+- PCA diagnostics and contribution analysis
+- clustering and dendrogram analysis
+- Expert PCA / UMAP preprocessing
+- PCA reconstruction cross-validation
+- nested predictive-model optimization
+
+Automatic methods therefore cannot reintroduce a hard-excluded region. The UI reports the normalized exclusion ranges and the number of spectral variables removed.
+
+Leaving the field blank disables the hard exclusion.
+
 ## What is compared
 
 Guided Analysis evaluates an explicit list of preprocessing recipes. The current candidates are:
@@ -58,6 +79,22 @@ SNV removes each spectrum's own mean and rescales by its own standard deviation.
 
 Therefore v5.2 does not assume SNV is beneficial. Every SNV recipe is compared against non-SNV alternatives, and the report explicitly summarizes whether SNV improved or reduced the relevant score for the loaded dataset.
 
+## Model Review slider behavior
+
+The Model Review slider is also explicit.
+
+Each completed optimization row stores its preprocessing recipe and model settings. When the slider moves:
+
+1. that row's stored preprocessing recipe is rebuilt;
+2. SVM scaling is applied when the trial used SVM;
+3. if the trial used PCA, the displayed axes are the actual first model-PCA scores;
+4. if the classifier did **not** use PCA, the app fits a clearly labeled display-only PCA to that trial's exact processed variables;
+5. the selected trial is highlighted in Optimization History.
+
+The Confusion Matrix and Fold Stability tabs summarize the final nested cross-validation result, so they intentionally do not change with the individual-trial slider.
+
+The logic is implemented in `review_tools.py`, separate from the GUI.
+
 ## Predictive modeling remains separate
 
 The PCA group-separation score is descriptive only. SVM / Random Forest predictive modeling still uses grouped nested cross-validation in `core.py`.
@@ -66,8 +103,11 @@ Any preprocessing decision that uses class labels for predictive modeling must h
 
 ## Files
 
-- `app.py` — small launcher that wires transparent guided selection into the UI
+- `app.py` — launcher plus explicit hard-exclusion routing and Model Review wiring
 - `app_ui.py` — the full v5.2 PySide6 interface
-- `transparent_guided.py` — explicit candidates, metrics, thresholds, and selection rules
+- `transparent_guided.py` — explicit PCA candidates, metrics, thresholds, and selection rules
+- `spectral_constraints.py` — hard spectral-range removal
+- `review_tools.py` — trial-specific Model Review reconstruction
 - `core.py` — preprocessing, PCA, diagnostics, clustering, and predictive-model implementations
-- `tests/test_transparent_guided.py` — tests including a dataset where SNV intentionally destroys useful group separation
+- `tests/test_transparent_guided.py` — transparent-selection and SNV behavior tests
+- `tests/test_v52_constraints_review.py` — hard-exclusion and Model Review regression tests
