@@ -2,17 +2,34 @@ from __future__ import annotations
 
 """Auditable supervised validation helpers for FTIR Workbench.
 
-Outer folds estimate generalization. Inner folds perform optimization. The returned
-objects explicitly record which samples/groups were held out, training-vs-validation
-gaps, and out-of-fold predictions so users can inspect the evidence directly.
+Outer folds estimate generalization. Inner folds perform *all* model/preprocessing
+selection. The outer test fold never participates in recipe selection, PCA fitting,
+hyperparameter tuning, imputation, centering/scaling, or model fitting.
 """
+
+import copy
+from dataclasses import asdict
+import json
 
 import numpy as np
 import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 import core
+from models import PLSDAClassifier
+import transparent_guided
+
+
+MODEL_FAMILIES = ("SVM", "Random Forest", "PLS-DA")
+INNER_STABILITY_PENALTY = 0.25
+COMPONENT_COMPLEXITY_PENALTY = 0.002
+PREPROCESSING_COMPLEXITY_PENALTY = 0.003
 
 
 def _specificity_table(y_true, y_pred, classes):
@@ -33,6 +50,170 @@ def _specificity_table(y_true, y_pred, classes):
             "specificity": float(specificity) if np.isfinite(specificity) else np.nan,
         })
     return pd.DataFrame(rows)
+
+
+def _recipe_key(steps):
+    return json.dumps([asdict(step) for step in steps], sort_keys=True)
+
+
+def _candidate_recipes(wn, n_features, base):
+    axis = np.arange(n_features, dtype=float) if wn is None else np.asarray(wn, dtype=float)
+    named = [(name, copy.deepcopy(steps)) for name, steps in transparent_guided.candidate_recipes(axis, n_features)]
+    if base:
+        key = _recipe_key(base)
+        if key not in {_recipe_key(steps) for _, steps in named}:
+            named.insert(0, ("Current expert recipe", copy.deepcopy(base)))
+    return named
+
+
+def _random_params(rng, model, maxpcs, n_samples, n_features):
+    max_pc = max(2, min(int(maxpcs), max(2, n_samples - 2), n_features))
+    if model == "SVM":
+        gamma_options = ["scale", 0.001, 0.01, 0.1]
+        return {
+            "model": model,
+            "use_pca": bool(rng.integers(2)),
+            "pcs": int(rng.integers(2, max_pc + 1)),
+            "C": float(10 ** rng.uniform(-2, 2)),
+            "kernel": ["linear", "rbf"][int(rng.integers(2))],
+            "gamma": gamma_options[int(rng.integers(len(gamma_options)))],
+        }
+    if model == "Random Forest":
+        return {
+            "model": model,
+            "use_pca": bool(rng.integers(2)),
+            "pcs": int(rng.integers(2, max_pc + 1)),
+            "trees": [200, 400][int(rng.integers(2))],
+            "depth": [None, 5, 10, 20][int(rng.integers(4))],
+            "leaf": int(rng.integers(1, 5)),
+        }
+    pls_max = max(1, min(10, max_pc, n_features, n_samples - 1))
+    return {
+        "model": "PLS-DA",
+        "use_pca": False,
+        "pcs": 0,
+        "pls_components": int(rng.integers(1, pls_max + 1)),
+    }
+
+
+def build_pipeline(steps, params, wn=None):
+    chain = [("prep", core.RecipeTransformer(copy.deepcopy(steps), wn=wn))]
+    model = params["model"]
+    if model == "SVM":
+        chain.append(("scale", StandardScaler()))
+    if bool(params.get("use_pca", False)):
+        chain.append((
+            "pca",
+            PCA(
+                n_components=int(params["pcs"]),
+                svd_solver="randomized",
+                random_state=42,
+            ),
+        ))
+    if model == "SVM":
+        classifier = SVC(
+            C=float(params["C"]),
+            kernel=params["kernel"],
+            gamma=params["gamma"],
+            class_weight="balanced",
+        )
+    elif model == "Random Forest":
+        classifier = RandomForestClassifier(
+            n_estimators=int(params["trees"]),
+            max_depth=params["depth"],
+            min_samples_leaf=int(params["leaf"]),
+            class_weight="balanced",
+            n_jobs=1,
+            random_state=42,
+        )
+    elif model == "PLS-DA":
+        classifier = PLSDAClassifier(
+            n_components=int(params["pls_components"]),
+            scale=False,
+        )
+    else:
+        raise ValueError(f"Unknown model family: {model}")
+    chain.append(("clf", classifier))
+    return Pipeline(chain)
+
+
+def search_audited(X, y, groups, base, trials, maxpcs, cv, seed, wn=None):
+    """Inner-CV search across explicit FTIR recipes and three model families.
+
+    The search space is intentionally restrained and returned row-by-row. There is
+    no opaque optimizer. Recipe/model choices are deterministic given the seed.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    rng = np.random.default_rng(seed)
+    recipes = _candidate_recipes(wn, X.shape[1], base)
+    history = []
+    best = None
+
+    for trial in range(int(trials)):
+        # Cycle deterministically so small trial counts still inspect multiple model
+        # families and preprocessing recipes before random repeats occur.
+        model = MODEL_FAMILIES[trial % len(MODEL_FAMILIES)]
+        recipe_index = (trial // len(MODEL_FAMILIES)) % len(recipes)
+        if trial >= len(MODEL_FAMILIES) * len(recipes):
+            recipe_index = int(rng.integers(len(recipes)))
+            model = MODEL_FAMILIES[int(rng.integers(len(MODEL_FAMILIES)))]
+        recipe_name, steps = recipes[recipe_index]
+        params = _random_params(rng, model, maxpcs, len(X), X.shape[1])
+        try:
+            values = cross_val_score(
+                build_pipeline(steps, params, wn=wn),
+                X,
+                y,
+                groups=groups,
+                cv=cv,
+                scoring="balanced_accuracy",
+                error_score="raise",
+                n_jobs=1,
+            )
+            score = float(values.mean())
+            std = float(values.std())
+            component_complexity = (
+                int(params.get("pls_components", 0))
+                if model == "PLS-DA"
+                else int(params.get("pcs", 0)) if params.get("use_pca") else 0
+            )
+            prep_complexity = transparent_guided.recipe_complexity(steps)
+            objective = (
+                score
+                - INNER_STABILITY_PENALTY * std
+                - COMPONENT_COMPLEXITY_PENALTY * component_complexity
+                - PREPROCESSING_COMPLEXITY_PENALTY * prep_complexity
+            )
+            row = {
+                "trial": trial,
+                "status": "complete",
+                "score": score,
+                "std": std,
+                "objective": objective,
+                "recipe_name": recipe_name,
+                "recipe_complexity": prep_complexity,
+                "recipe": _recipe_key(steps),
+                **params,
+            }
+            history.append(row)
+            if best is None or objective > best[0]:
+                best = (objective, copy.deepcopy(steps), dict(params))
+        except Exception as exc:
+            history.append({
+                "trial": trial,
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "recipe_name": recipe_name,
+                "recipe_complexity": transparent_guided.recipe_complexity(steps),
+                "recipe": _recipe_key(steps),
+                **params,
+            })
+
+    if best is None:
+        raise RuntimeError("All inner optimization trials failed.")
+    return best[1], best[2], pd.DataFrame(history)
 
 
 def nested_optimize_audited(
@@ -87,7 +268,7 @@ def nested_optimize_audited(
             )
         inner = StratifiedGroupKFold(inner_n, shuffle=True, random_state=1000 + int(seed) + fold)
 
-        steps, params, fold_history = core.search(
+        steps, params, fold_history = search_audited(
             X[train],
             y[train],
             groups[train],
@@ -103,7 +284,7 @@ def nested_optimize_audited(
             raise RuntimeError(f"All inner optimization trials failed in outer fold {fold}.")
         selected_inner = complete.sort_values("objective", ascending=False).iloc[0]
 
-        model = core.pipe(steps, params, wn=wn).fit(X[train], y[train])
+        model = build_pipeline(steps, params, wn=wn).fit(X[train], y[train])
         pred_train = model.predict(X[train])
         pred_test = model.predict(X[test])
         predictions[test] = pred_test
@@ -121,6 +302,7 @@ def nested_optimize_audited(
         best_rows.append({
             "fold": fold,
             "recipe": selected_inner.recipe,
+            "recipe_name": selected_inner.get("recipe_name", ""),
             "inner_cv_balanced_accuracy": inner_bal,
             "inner_cv_std": inner_std,
             **params,
@@ -141,6 +323,8 @@ def nested_optimize_audited(
             "test_group_count": len(test_groups),
             "minimum_inner_groups_per_class": int(inner_support.min()),
             "inner_folds_used": int(inner_n),
+            "selected_model": params["model"],
+            "selected_recipe": selected_inner.get("recipe_name", ""),
             "group_overlap_count": 0,
         })
         for idx in train:
@@ -177,13 +361,15 @@ def nested_optimize_audited(
     else:
         overfit = "low"
 
+    model_counts = fold_table.selected_model.value_counts().to_dict()
     summary = (
         f"Nested grouped CV balanced accuracy is {bal:.3f}; macro F1 is {macro:.3f}. "
         f"Outer-fold balanced accuracy averages {mean_outer:.3f} ± "
         f"{float(fold_table.outer_balanced_accuracy.std(ddof=1)) if len(fold_table) > 1 else 0.0:.3f}. "
         f"Training balanced accuracy averages {mean_train:.3f}, giving a training-to-outer gap of {gap:.3f} ({overfit} overfitting warning). "
         f"Worst outer fold={float(fold_table.outer_balanced_accuracy.min()):.3f}; best={float(fold_table.outer_balanced_accuracy.max()):.3f}. "
-        "Every outer test group is disjoint from its training groups, all learned preprocessing/model steps are fitted inside the training side of each split, and all reported predictions are out-of-fold."
+        f"Outer-fold selected model families: {model_counts}. "
+        "Every outer test group is disjoint from its training groups; preprocessing recipe, PCA/PLS dimensionality, and model hyperparameters are chosen only inside inner grouped CV; all reported predictions are out-of-fold."
     )
 
     return {
@@ -205,6 +391,13 @@ def nested_optimize_audited(
         "train_validation_gap": gap,
         "overfitting_level": overfit,
         "validation_summary": summary,
+        "selection_rules": {
+            "model_families": list(MODEL_FAMILIES),
+            "inner_stability_penalty": INNER_STABILITY_PENALTY,
+            "component_complexity_penalty": COMPONENT_COMPLEXITY_PENALTY,
+            "preprocessing_complexity_penalty": PREPROCESSING_COMPLEXITY_PENALTY,
+            "preprocessing_candidates": "transparent_guided.candidate_recipes plus the current expert recipe when distinct",
+        },
     }
 
 
