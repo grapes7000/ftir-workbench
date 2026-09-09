@@ -137,6 +137,32 @@ def build_pipeline(steps, params, wn=None):
     return Pipeline(chain)
 
 
+def _candidate_from_history_row(row):
+    """Reconstruct one inner-selected candidate without consulting outer-test data."""
+    steps = [core.Step(**item) for item in json.loads(str(row.recipe))]
+    model = str(row.model)
+    use_pca = bool(row.get("use_pca", False))
+    params = {
+        "model": model,
+        "use_pca": use_pca,
+        "pcs": int(row.pcs) if use_pca and pd.notna(row.get("pcs", np.nan)) else 0,
+    }
+    if model == "SVM":
+        gamma = row.gamma
+        if isinstance(gamma, str):
+            cleaned = gamma
+        else:
+            cleaned = float(gamma)
+        params.update(C=float(row.C), kernel=str(row.kernel), gamma=cleaned)
+    elif model == "Random Forest":
+        depth = row.depth
+        depth = None if pd.isna(depth) else int(depth)
+        params.update(trees=int(row.trees), depth=depth, leaf=int(row.leaf))
+    else:
+        params.update(pls_components=int(row.pls_components))
+    return steps, params
+
+
 def search_audited(X, y, groups, base, trials, maxpcs, cv, seed, wn=None):
     """Inner-CV search across explicit FTIR recipes and three model families.
 
@@ -241,6 +267,8 @@ def nested_optimize_audited(
     history = []
     best_rows = []
     split_rows = []
+    family_fold_rows = []
+    family_oof_rows = []
 
     for fold, (train, test) in enumerate(outer.split(X, y, groups), 1):
         train_groups = set(groups[train].astype(str))
@@ -284,6 +312,8 @@ def nested_optimize_audited(
             raise RuntimeError(f"All inner optimization trials failed in outer fold {fold}.")
         selected_inner = complete.sort_values("objective", ascending=False).iloc[0]
 
+        # Main nested-selection result: inner CV chooses recipe/model jointly, then
+        # the untouched outer fold evaluates that complete selection procedure.
         model = build_pipeline(steps, params, wn=wn).fit(X[train], y[train])
         pred_train = model.predict(X[train])
         pred_test = model.predict(X[test])
@@ -296,6 +326,51 @@ def nested_optimize_audited(
         test_f1 = float(f1_score(y[test], pred_test, average="macro", zero_division=0))
         inner_bal = float(selected_inner.score)
         inner_std = float(selected_inner.get("std", np.nan))
+
+        # Fair family comparison: for each family, select its best recipe/parameters
+        # using INNER data only, then evaluate all families on this SAME outer fold.
+        for family in MODEL_FAMILIES:
+            family_candidates = complete.loc[complete.model == family]
+            if family_candidates.empty:
+                continue
+            family_inner = family_candidates.sort_values("objective", ascending=False).iloc[0]
+            family_steps, family_params = _candidate_from_history_row(family_inner)
+            family_model = build_pipeline(family_steps, family_params, wn=wn).fit(
+                X[train], y[train]
+            )
+            family_train_pred = family_model.predict(X[train])
+            family_test_pred = family_model.predict(X[test])
+            family_train_bal = float(balanced_accuracy_score(y[train], family_train_pred))
+            family_outer_bal = float(balanced_accuracy_score(y[test], family_test_pred))
+            family_outer_f1 = float(
+                f1_score(y[test], family_test_pred, average="macro", zero_division=0)
+            )
+            family_fold_rows.append({
+                "fold": fold,
+                "model": family,
+                "recipe_name": family_inner.get("recipe_name", ""),
+                "recipe": family_inner.recipe,
+                "inner_cv_balanced_accuracy": float(family_inner.score),
+                "inner_cv_std": float(family_inner.get("std", np.nan)),
+                "train_balanced_accuracy": family_train_bal,
+                "outer_balanced_accuracy": family_outer_bal,
+                "outer_macro_f1": family_outer_f1,
+                "train_outer_gap": family_train_bal - family_outer_bal,
+                "n_train": len(train),
+                "n_test": len(test),
+            })
+            for sample_index, truth, prediction, group_value in zip(
+                test, y[test], family_test_pred, groups[test]
+            ):
+                family_oof_rows.append({
+                    "sample_index": int(sample_index),
+                    "outer_fold": fold,
+                    "model": family,
+                    "group": str(group_value),
+                    "truth": truth,
+                    "prediction": prediction,
+                    "correct": bool(prediction == truth),
+                })
 
         fold_history["outer_fold"] = fold
         history.append(fold_history)
@@ -349,6 +424,31 @@ def nested_optimize_audited(
     })
     specificity = _specificity_table(y, predictions, classes)
 
+    family_fold_table = pd.DataFrame(family_fold_rows)
+    family_oof = pd.DataFrame(family_oof_rows)
+    if not family_fold_table.empty:
+        family_summary = (
+            family_fold_table.groupby("model", as_index=False)
+            .agg(
+                folds=("fold", "nunique"),
+                mean_inner_cv_balanced_accuracy=("inner_cv_balanced_accuracy", "mean"),
+                mean_outer_balanced_accuracy=("outer_balanced_accuracy", "mean"),
+                outer_balanced_accuracy_sd=("outer_balanced_accuracy", "std"),
+                worst_outer_balanced_accuracy=("outer_balanced_accuracy", "min"),
+                best_outer_balanced_accuracy=("outer_balanced_accuracy", "max"),
+                mean_outer_macro_f1=("outer_macro_f1", "mean"),
+                mean_train_outer_gap=("train_outer_gap", "mean"),
+            )
+            .sort_values(
+                ["mean_outer_balanced_accuracy", "outer_balanced_accuracy_sd"],
+                ascending=[False, True],
+            )
+            .reset_index(drop=True)
+        )
+        family_summary["outer_balanced_accuracy_sd"] = family_summary["outer_balanced_accuracy_sd"].fillna(0.0)
+    else:
+        family_summary = pd.DataFrame()
+
     bal = float(balanced_accuracy_score(y, predictions))
     macro = float(f1_score(y, predictions, average="macro", zero_division=0))
     mean_train = float(fold_table.train_balanced_accuracy.mean())
@@ -362,14 +462,23 @@ def nested_optimize_audited(
         overfit = "low"
 
     model_counts = fold_table.selected_model.value_counts().to_dict()
+    family_text = ""
+    if not family_summary.empty:
+        leader = family_summary.iloc[0]
+        family_text = (
+            f" Fair outer-fold family comparison ranks {leader.model} highest on mean held-out balanced accuracy "
+            f"({float(leader.mean_outer_balanced_accuracy):.3f} ± {float(leader.outer_balanced_accuracy_sd):.3f}); "
+            "all families use the same outer partitions and family-specific tuning occurs only in inner CV."
+        )
     summary = (
         f"Nested grouped CV balanced accuracy is {bal:.3f}; macro F1 is {macro:.3f}. "
         f"Outer-fold balanced accuracy averages {mean_outer:.3f} ± "
         f"{float(fold_table.outer_balanced_accuracy.std(ddof=1)) if len(fold_table) > 1 else 0.0:.3f}. "
         f"Training balanced accuracy averages {mean_train:.3f}, giving a training-to-outer gap of {gap:.3f} ({overfit} overfitting warning). "
         f"Worst outer fold={float(fold_table.outer_balanced_accuracy.min()):.3f}; best={float(fold_table.outer_balanced_accuracy.max()):.3f}. "
-        f"Outer-fold selected model families: {model_counts}. "
-        "Every outer test group is disjoint from its training groups; preprocessing recipe, PCA/PLS dimensionality, and model hyperparameters are chosen only inside inner grouped CV; all reported predictions are out-of-fold."
+        f"Outer-fold selected model families: {model_counts}."
+        + family_text
+        + " Every outer test group is disjoint from its training groups; preprocessing recipe, PCA/PLS dimensionality, and model hyperparameters are chosen only inside inner grouped CV; all reported predictions are out-of-fold."
     )
 
     return {
@@ -391,12 +500,16 @@ def nested_optimize_audited(
         "train_validation_gap": gap,
         "overfitting_level": overfit,
         "validation_summary": summary,
+        "model_family_folds": family_fold_table,
+        "model_family_summary": family_summary,
+        "model_family_oof_predictions": family_oof,
         "selection_rules": {
             "model_families": list(MODEL_FAMILIES),
             "inner_stability_penalty": INNER_STABILITY_PENALTY,
             "component_complexity_penalty": COMPONENT_COMPLEXITY_PENALTY,
             "preprocessing_complexity_penalty": PREPROCESSING_COMPLEXITY_PENALTY,
             "preprocessing_candidates": "transparent_guided.candidate_recipes plus the current expert recipe when distinct",
+            "family_comparison": "Each model family is tuned only on inner training data and evaluated on identical outer held-out folds.",
         },
     }
 
