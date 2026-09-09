@@ -169,3 +169,23 @@ The workbench is intended to assist analytical exploration and model development
 - A cluster is a mathematical grouping, not proof of chemical identity.
 - High classification accuracy is not meaningful if independent samples or groups leak across validation folds.
 - Automated recommendations remain reviewable and overrideable in the expert controls.
+
+
+### Selecting data and validation mode
+
+Use **Select data…** beside Load CSV to choose spectra for all analyses. Search
+metadata (for example, a brand or station), then include or exclude visible rows.
+Clearing the search shows all rows again. Reopen the dialog to restore excluded
+rows. Applying a selection clears previous results; rerun the analysis.
+
+Predictive Modeling offers **Independent sources (stations / batches)** and
+**Exploratory — individual spectra**. The exploratory option does not require
+station or batch groups. It holds individual spectra aside and clearly labels
+its results: repeated measurements may inflate performance, and scores do not
+establish generalization to new sources. It needs at least three spectra per
+included class. Independent-source validation retains its group support checks.
+
+Test rounds (outer folds) measure performance on held-out data; tuning rounds
+(inner folds) select settings within the training data. Start with 3 test rounds
+and 2 tuning rounds. Fewer test rounds leave less data for training and are not
+a general fix for insufficient independent sources.

@@ -1,4 +1,5 @@
 import copy
+from busy_ui import busy
 import json
 import sys
 import traceback
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as Canvas
 from matplotlib.figure import Figure
+from matplotlib import colormaps
 from scipy.cluster.hierarchy import dendrogram
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -17,6 +19,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -25,6 +29,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QToolButton,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -56,15 +62,33 @@ class Plot(Canvas):
 
     def scatter_samples(self, ax, x, y, z=None, labels=None, indices=None, **kwargs):
         indices = np.arange(len(x)) if indices is None else np.asarray(indices)
-        colors = labels
-        if labels is not None and not np.issubdtype(np.asarray(labels).dtype, np.number):
-            colors = pd.Categorical(labels).codes
-        if z is None:
-            artist = ax.scatter(x, y, c=colors, picker=5, **kwargs)
-        else:
-            artist = ax.scatter(x, y, z, c=colors, picker=5, **kwargs)
-        artist._sample_indices = indices
-        return artist
+        coordinates = [np.asarray(x), np.asarray(y)]
+        if z is not None:
+            coordinates.append(np.asarray(z))
+        if labels is None:
+            artist = ax.scatter(*coordinates, picker=5, **kwargs)
+            artist._sample_indices = indices
+            return artist
+
+        # Use the same deterministic class order in every view of the dataset.
+        labels = pd.Series(labels).fillna("(missing)").astype(str).to_numpy()
+        classes = sorted(set(labels))
+        palette = colormaps["tab20"].colors
+        markers = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "*")
+        artists = []
+        for i, label in enumerate(classes):
+            mask = labels == label
+            style = dict(kwargs)
+            style.update(color=palette[i % len(palette)],
+                         marker=markers[(i + i // len(palette)) % len(markers)],
+                         label=label, edgecolors="#333333", linewidths=0.45)
+            artist = ax.scatter(*(values[mask] for values in coordinates),
+                                picker=5, **style)
+            artist._sample_indices = indices[mask]
+            artists.append(artist)
+        ax.legend(title="Class key", loc="upper left", bbox_to_anchor=(1.02, 1),
+                  fontsize=8, title_fontsize=9, ncol=max(1, (len(classes) + 19) // 20))
+        return artists
 
     def _picked(self, event):
         artist = event.artist
@@ -74,6 +98,34 @@ class Plot(Canvas):
         point = int(event.ind[0])
         if point < len(indices) and self.pick_callback:
             self.pick_callback(int(indices[point]))
+
+
+class GroupSelector(QToolButton):
+    """Dropdown with independent checkboxes for multi-column grouping."""
+
+    def __init__(self):
+        super().__init__()
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setMenu(QMenu(self))
+        self.set_columns([], [])
+
+    def set_columns(self, columns, selected):
+        self.menu().clear()
+        for column in columns:
+            action = self.menu().addAction(str(column))
+            action.setCheckable(True)
+            action.setChecked(column in selected)
+            action.toggled.connect(self._update_text)
+        self.setEnabled(bool(len(columns)))
+        self._update_text()
+
+    def selected_columns(self):
+        return [action.text() for action in self.menu().actions() if action.isChecked()]
+
+    def _update_text(self):
+        self.setText(", ".join(self.selected_columns()) or "No grouping")
+        self.setToolTip("Select one or more metadata columns for independent groups")
 
 
 class Main(QMainWindow):
@@ -113,6 +165,11 @@ class Main(QMainWindow):
         load_button.clicked.connect(self.load)
         header.addWidget(self.path, 1)
         header.addWidget(load_button)
+        select_button = QPushButton("Select data…")
+        select_button.clicked.connect(self.select_data)
+        header.addWidget(select_button)
+        self.selection_status = QLabel("No data loaded")
+        header.addWidget(self.selection_status)
         layout.addLayout(header)
 
         self.tabs = QTabWidget()
@@ -409,10 +466,22 @@ class Main(QMainWindow):
         layout.addWidget(note)
 
         grid = QGridLayout()
-        self.label = QLineEdit()
-        self.label.setPlaceholderText("Detected automatically after loading data")
-        self.groups = QLineEdit()
-        self.groups.setPlaceholderText("Detected independent grouping columns")
+        self.label = QComboBox()
+        self.label.setPlaceholderText("Load data to select a label")
+        self.label.setEnabled(False)
+        self.validation_mode = QComboBox()
+        self.validation_mode.addItem("Independent sources (stations / batches)", "grouped")
+        self.validation_mode.addItem("Exploratory — individual spectra", "exploratory")
+        layout.addWidget(self.validation_mode)
+        explanation = QLabel("Test rounds (outer folds) hold data aside to measure performance. "
+            "Tuning rounds (inner folds) choose model settings using only the remaining data. "
+            "Exploratory mode splits individual spectra; repeated measurements may inflate scores, "
+            "so it does not measure performance on new stations or batches.")
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self.groups = GroupSelector()
+        self.validation_mode.currentIndexChanged.connect(
+            lambda: self.groups.setEnabled(self.validation_mode.currentData() == "grouped"))
         self.minG = QSpinBox()
         self.minG.setRange(2, 20)
         self.minG.setValue(3)
@@ -432,9 +501,9 @@ class Main(QMainWindow):
         controls = [
             ("Label", self.label),
             ("Group columns", self.groups),
-            ("Min groups/class", self.minG),
-            ("Outer folds", self.outer),
-            ("Inner folds", self.inner),
+            ("Min sources / spectra per class", self.minG),
+            ("Test rounds (outer folds)", self.outer),
+            ("Tuning rounds (inner folds)", self.inner),
             ("Trials/fold", self.trials),
             ("Max PCs", self.maxpc),
         ]
@@ -459,6 +528,9 @@ class Main(QMainWindow):
     def _build_review_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        self.review_validation_note = QLabel()
+        self.review_validation_note.setWordWrap(True)
+        layout.addWidget(self.review_validation_note)
         self.reviewTabs = QTabWidget()
         self.hist = Plot()
         self.model_compare = Plot()
@@ -503,6 +575,7 @@ class Main(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.sample_dock = dock
 
+    @busy("Loading data")
     def load(self):
         path = self.path.text().strip()
         if not path:
@@ -511,6 +584,10 @@ class Main(QMainWindow):
             return
         try:
             self.data = load_ftir(path)
+            self.full_data = self.data
+            self.active_rows = np.arange(len(self.data[0]))
+            self.selection_status.setText(f"All {len(self.active_rows)} spectra selected")
+            self.opt = None
             self.path.setText(path)
             meta, wn, spectra = self.data
             self.metadata_schema = infer_metadata_schema(meta)
@@ -533,6 +610,95 @@ class Main(QMainWindow):
             self.statusBar().showMessage("Dataset loaded. Guided Analysis is ready.")
         except Exception:
             self.err()
+
+    def select_data(self):
+        if self.data is None:
+            return
+        meta, _, _ = self.full_data
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Choose spectra for all analyses")
+        dialog.resize(1000, 650)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Check the rows to include. Search metadata to find brands, stations or samples."))
+        search = QLineEdit()
+        search.setPlaceholderText("Search metadata…")
+        layout.addWidget(search)
+        table = QTableWidget(len(meta), len(meta.columns) + 1)
+        table.setHorizontalHeaderLabels(["Include"] + list(map(str, meta.columns)))
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        active = set(self.active_rows)
+        for row in range(len(meta)):
+            item = QTableWidgetItem(str(row + 1))
+            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if row in active else Qt.Unchecked)
+            table.setItem(row, 0, item)
+            for col, value in enumerate(meta.iloc[row], 1):
+                table.setItem(row, col, QTableWidgetItem(str(value)))
+        def filter_rows(text):
+            for row in range(len(meta)):
+                table.setRowHidden(row, text.casefold() not in " ".join(map(str, meta.iloc[row])).casefold())
+        search.textChanged.connect(filter_rows)
+        layout.addWidget(table)
+        buttons = QHBoxLayout()
+        def check_visible(state):
+            for row in range(len(meta)):
+                if not table.isRowHidden(row):
+                    table.item(row, 0).setCheckState(state)
+        for title, state in (("Include visible", Qt.Checked), ("Exclude visible", Qt.Unchecked)):
+            button = QPushButton(title)
+            button.clicked.connect(lambda checked=False, state=state: check_visible(state))
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        actions = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        actions.accepted.connect(dialog.accept)
+        actions.rejected.connect(dialog.reject)
+        layout.addWidget(actions)
+        if dialog.exec() == QDialog.Accepted:
+            rows = [r for r in range(len(meta)) if table.item(r, 0).checkState() == Qt.Checked]
+            if len(rows) < 2:
+                QMessageBox.information(self, "Select data", "Select at least two spectra.")
+                return
+            self.apply_data_selection(rows)
+
+    def apply_data_selection(self, rows):
+        meta, wn, spectra = self.full_data
+        self.active_rows = np.asarray(rows, dtype=int)
+        self.data = (meta.iloc[rows].reset_index(drop=True), wn,
+                     spectra.iloc[rows].reset_index(drop=True))
+        self.last = self.opt = self.guided = self.embed = None
+        self.trials_df = pd.DataFrame()
+        self.review_validation_note.clear()
+        self.opt_wn = self.opt_constraint = None
+        for text in self.findChildren(QPlainTextEdit):
+            text.clear()
+        self.selected_index = None
+        self.manual_cluster_labels = None
+        self.frames = []
+        for plot in self.findChildren(Plot):
+            plot.fig.clear()
+            plot.draw()
+        for table in self.findChildren(QTableWidget):
+            table.setRowCount(0)
+        self.refresh()
+        self.metadata_schema = infer_metadata_schema(self.data[0])
+        self._populate_qc()
+        self._populate_metadata_table()
+        self.selection_status.setText(f"{len(rows)} / {len(meta)} spectra selected")
+        self.auto_status.setText("Data selection changed — rerun analysis")
+        self.guide_report.setPlainText("All analyses now use the selected spectra. Rerun to update results.")
+        self.sample_text.clear()
+        self.statusBar().showMessage("Data selection applied to all analyses. Rerun to update results.")
+
+    def predictive_eligibility(self, meta, label):
+        if self.validation_mode.currentData() == "exploratory":
+            y = meta[label].astype(str).to_numpy()
+            counts = pd.Series(y).value_counts()
+            table = pd.DataFrame({"class": counts.index, "spectra": counts.values,
+                                  "eligible": counts.values >= max(3, self.minG.value())})
+            return table, y, np.arange(len(y))
+        if not self.groups.selected_columns():
+            raise ValueError("Choose a source column, or select exploratory individual-spectra mode.")
+        return eligibility(meta, label, self.groups.selected_columns(), self.minG.value())
 
     def _populate_qc(self):
         meta, wn, spectra = self.data
@@ -582,10 +748,13 @@ class Main(QMainWindow):
         meta, _, _ = self.data
         label = suggest_label_column(meta, self.metadata_schema)
         groups = suggest_group_columns(meta, self.metadata_schema)
-        if label:
-            self.label.setText(label)
-        if groups:
-            self.groups.setText(",".join(groups))
+        self.label.clear()
+        self.label.addItem("No label", "")
+        for column in meta.columns:
+            self.label.addItem(str(column), str(column))
+        self.label.setEnabled(bool(len(meta.columns)))
+        self.label.setCurrentIndex(max(0, self.label.findData(label)))
+        self.groups.set_columns(meta.columns, groups or [])
 
         if label and groups and label in meta:
             try:
@@ -613,6 +782,7 @@ class Main(QMainWindow):
         self.npcs.setValue(max(3, min(20, len(meta) - 2, len(wn))))
         self.maxpc.setValue(max(2, min(25, len(meta) - 2, len(wn))))
 
+    @busy("Analyzing dataset")
     def auto_analyze(self):
         if self.data is None:
             QMessageBox.information(self, "Guided Analysis", "Load a dataset first.")
@@ -637,9 +807,9 @@ class Main(QMainWindow):
             self.npcs.setValue(max(2, result["selected"]["best_components"]))
 
             if result["suggested_label"]:
-                self.label.setText(result["suggested_label"])
+                self.label.setCurrentIndex(max(0, self.label.findData(result["suggested_label"])))
             if result["suggested_groups"]:
-                self.groups.setText(",".join(result["suggested_groups"]))
+                self.groups.set_columns(self.data[0].columns, result["suggested_groups"])
 
             self.render_guided()
             self.render_compare()
@@ -678,8 +848,8 @@ class Main(QMainWindow):
         label = None
         if self.guided and self.guided.get("suggested_label") in meta:
             label = self.guided["suggested_label"]
-        elif self.label.text().strip() in meta:
-            label = self.label.text().strip()
+        elif (self.label.currentData() or "") in meta:
+            label = (self.label.currentData() or "")
         if label:
             return meta[label].astype(str).to_numpy(), label
         if self.guided and "clustering" in self.guided:
@@ -797,6 +967,7 @@ class Main(QMainWindow):
         ax.legend(fontsize=8)
         self.guide_contrib.draw()
 
+    @busy("Comparing preprocessing recipes")
     def run_compare(self):
         if self.data is None:
             QMessageBox.information(self, "PCA Compare", "Load a dataset first.")
@@ -996,6 +1167,7 @@ class Main(QMainWindow):
     def axes(self):
         return self.pc1.value() - 1, self.pc2.value() - 1, self.pc3.value() - 1
 
+    @busy("Calculating projection")
     def project(self):
         if self.data is None:
             return
@@ -1088,13 +1260,14 @@ class Main(QMainWindow):
         ax.set_ylabel(f"{self.method.currentText()} {y + 1}")
         self.proj.draw()
 
+    @busy("Validating PCA")
     def run_cv(self):
         if self.data is None:
             return
         try:
             self.sync()
             meta, wn, spectra = self.data
-            cols = [c.strip() for c in self.groups.text().split(",") if c.strip()]
+            cols = self.groups.selected_columns()
             groups = make_groups(meta, cols) if cols and all(c in meta for c in cols) else None
             data, best = pca_cv(
                 spectra.to_numpy(),
@@ -1122,6 +1295,7 @@ class Main(QMainWindow):
         except Exception:
             self.err()
 
+    @busy("Clustering spectra")
     def do_cluster(self):
         if self.embed is None:
             self.project()
@@ -1150,6 +1324,7 @@ class Main(QMainWindow):
         if self.frames:
             self.draw_projection(self.embed, self.frames[index]["labels"])
 
+    @busy("Analyzing clusters")
     def run_cluster_analysis(self):
         if self.data is None:
             return
@@ -1218,38 +1393,34 @@ class Main(QMainWindow):
             return
         try:
             meta, _, _ = self.data
-            label = self.label.text().strip()
-            cols = [c.strip() for c in self.groups.text().split(",") if c.strip()]
+            label = (self.label.currentData() or "")
+            cols = self.groups.selected_columns()
             if label not in meta:
                 raise ValueError("Choose a valid metadata label.")
-            if not cols:
-                raise ValueError("Choose at least one independent grouping column.")
-            data, _, _ = eligibility(
-                meta.dropna(subset=[label]).reset_index(drop=True),
-                label,
-                cols,
-                self.minG.value(),
+            if not cols and self.validation_mode.currentData() == "grouped":
+                raise ValueError("Choose a source column, or select exploratory individual-spectra mode.")
+            data, _, _ = self.predictive_eligibility(
+                meta.dropna(subset=[label]).reset_index(drop=True), label
             )
             self._table(self.elig, data)
         except Exception:
             self.err()
 
+    @busy("Tuning and validating models")
     def optimize(self):
         if self.data is None:
             return
         try:
             self.sync()
             meta, wn, spectra = self.data
-            label = self.label.text().strip()
+            label = (self.label.currentData() or "")
             if label not in meta:
                 raise ValueError("Choose a valid label column.")
             valid = meta[label].notna()
             filtered_meta = meta.loc[valid].reset_index(drop=True)
             X = spectra.loc[valid].to_numpy()
-            cols = [c.strip() for c in self.groups.text().split(",") if c.strip()]
-            eligibility_table, y, groups = eligibility(
-                filtered_meta, label, cols, self.minG.value()
-            )
+            cols = self.groups.selected_columns()
+            eligibility_table, y, groups = self.predictive_eligibility(filtered_meta, label)
             allowed = set(eligibility_table.loc[eligibility_table.eligible, "class"])
             keep = np.array([value in allowed for value in y])
             X, y, groups = X[keep], y[keep], groups[keep]
@@ -1276,6 +1447,7 @@ class Main(QMainWindow):
                 outer,
                 self.inner.value(),
                 wn=wn,
+                validation_mode=self.validation_mode.currentData(),
             )
             self.opt = (result, X, y, groups)
             self.render_review()
@@ -1285,6 +1457,7 @@ class Main(QMainWindow):
 
     def render_review(self):
         result, X, y, groups = self.opt
+        self.review_validation_note.setText(result.get("validation_summary", ""))
         history = result["history"]
         complete = history[history.status == "complete"].copy()
         complete["running_best"] = complete.objective.cummax()
@@ -1329,6 +1502,7 @@ class Main(QMainWindow):
             result["cm"], index=result["classes"], columns=result["classes"]
         ).to_csv(out / "confusion_matrix.csv")
 
+    @busy("Rebuilding trial preview")
     def replay_trial(self, index):
         if not hasattr(self, "trials_df") or self.trials_df.empty:
             return
@@ -1346,7 +1520,10 @@ class Main(QMainWindow):
             )
         scores = result["scores"]
         if scores.shape[1] >= 3:
-            ax.scatter(scores[:, 0], scores[:, 1], scores[:, 2])
+            labels, _ = self._default_colors()
+            self.trialplot.scatter_samples(
+                ax, scores[:, 0], scores[:, 1], scores[:, 2], labels=labels
+            )
         ax.set_title(
             f"Trial {int(row.trial)} {row.model} PCA={row.use_pca} score={row.score:.3f}"
         )

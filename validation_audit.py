@@ -16,7 +16,7 @@ import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import StratifiedGroupKFold, cross_val_score
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -253,6 +253,7 @@ def nested_optimize_audited(
     inner_folds=2,
     wn=None,
     seed=42,
+    validation_mode="grouped",
 ):
     X = np.asarray(X)
     y = np.asarray(y)
@@ -260,7 +261,13 @@ def nested_optimize_audited(
     if not (len(X) == len(y) == len(groups)):
         raise ValueError("X, y, and groups must contain the same number of samples.")
 
-    outer = StratifiedGroupKFold(int(outer_folds), shuffle=True, random_state=int(seed))
+    if validation_mode not in {"grouped", "exploratory"}:
+        raise ValueError("Unknown validation mode.")
+    exploratory = validation_mode == "exploratory"
+    if exploratory:
+        groups = np.arange(len(y))
+    splitter = StratifiedKFold if exploratory else StratifiedGroupKFold
+    outer = splitter(int(outer_folds), shuffle=True, random_state=int(seed))
     predictions = np.empty(len(y), dtype=object)
     outer_assignment = np.full(len(y), -1, dtype=int)
     folds = []
@@ -270,7 +277,7 @@ def nested_optimize_audited(
     family_fold_rows = []
     family_oof_rows = []
 
-    for fold, (train, test) in enumerate(outer.split(X, y, groups), 1):
+    for fold, (train, test) in enumerate(outer.split(X, y) if exploratory else outer.split(X, y, groups), 1):
         train_groups = set(groups[train].astype(str))
         test_groups = set(groups[test].astype(str))
         overlap = train_groups.intersection(test_groups)
@@ -284,6 +291,7 @@ def nested_optimize_audited(
             .drop_duplicates()
             .groupby("class")
             .size()
+            .reindex(np.unique(y.astype(str)), fill_value=0)
         )
         if inner_support.empty:
             raise ValueError(f"Outer fold {fold} has no class/group support for inner CV.")
@@ -292,9 +300,12 @@ def nested_optimize_audited(
             limiting = ", ".join(f"{label}={count}" for label, count in inner_support.items())
             raise ValueError(
                 f"Outer fold {fold} leaves fewer than two independent groups in at least one class for inner CV ({limiting}). "
-                "Use fewer outer folds, collect more independent groups, or treat the supervised result as unsupported."
+                "Check source columns and class eligibility; collect more independent sources or use explicitly exploratory individual-spectra validation. Fewer outer folds can leave less training data."
             )
-        inner = StratifiedGroupKFold(inner_n, shuffle=True, random_state=1000 + int(seed) + fold)
+        inner = splitter(inner_n, shuffle=True, random_state=1000 + int(seed) + fold)
+
+        if exploratory:
+            inner = list(inner.split(X[train], y[train]))
 
         steps, params, fold_history = search_audited(
             X[train],
@@ -481,7 +492,16 @@ def nested_optimize_audited(
         + " Every outer test group is disjoint from its training groups; preprocessing recipe, PCA/PLS dimensionality, and model hyperparameters are chosen only inside inner grouped CV; all reported predictions are out-of-fold."
     )
 
+    if exploratory:
+        summary = ("EXPLORATORY individual-spectra validation. Repeated measurements may inflate scores; "
+                   "this does not estimate performance on unseen stations or batches. "
+                   + summary.replace("Nested grouped CV", "Nested individual-spectra CV")
+                   .replace("Every outer test group is disjoint from its training groups",
+                            "Every outer test spectrum is disjoint from its training spectra")
+                   .replace("inner grouped CV", "inner individual-spectra CV"))
+
     return {
+        "validation_mode": validation_mode,
         "pred": predictions,
         "oof_predictions": oof,
         "outer_assignments": outer_assignment,
@@ -527,6 +547,7 @@ def permutation_test_nested(
     inner_folds=2,
     wn=None,
     seed=123,
+    validation_mode="grouped",
 ):
     """Optional nested-CV null test. Permutations are not optimized more than the real model."""
     rng = np.random.default_rng(seed)
@@ -546,6 +567,7 @@ def permutation_test_nested(
                 inner_folds=inner_folds,
                 wn=wn,
                 seed=seed + i + 1,
+                validation_mode=validation_mode,
             )
             scores.append(float(result["balanced_accuracy"]))
         except Exception:

@@ -20,6 +20,7 @@ import predictive_health
 import scientific_analysis
 import transparent_guided
 import validation_audit
+from busy_ui import busy
 
 
 def _record(row):
@@ -321,6 +322,7 @@ def _populate_health_workspace(window):
     window._table(window.health_stability, stability)
 
 
+@busy("Running permutation test")
 def _run_permutation_test(window):
     if not getattr(window, "opt", None):
         try:
@@ -354,6 +356,7 @@ def _run_permutation_test(window):
             inner_folds=int(window.inner.value()),
             wn=getattr(window, "opt_wn", None),
             seed=123,
+            validation_mode=result.get("validation_mode", "grouped"),
         )
         result["permutation"] = permutation
         _populate_health_workspace(window)
@@ -427,6 +430,7 @@ def install_gui_extensions(app_ui):
         layout.addLayout(row)
         self.tabs.addTab(page, "Model Health")
 
+    @busy("Loading data and checking quality")
     def enhanced_load(self):
         original_load(self)
         if getattr(self, "data", None) is None or not hasattr(self, "health_report"):

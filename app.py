@@ -3,6 +3,7 @@ from __future__ import annotations
 """FTIR Workbench v5.2 launcher with transparent guided analysis and hard constraints."""
 
 import copy
+from busy_ui import busy
 import sys
 
 import numpy as np
@@ -121,6 +122,7 @@ class Main(app_ui.Main):
             "the excluded wavelengths."
         )
 
+    @busy("Analyzing dataset")
     def auto_analyze(self):
         if self.data is None:
             app_ui.QMessageBox.information(self, "Guided Analysis", "Load a dataset first.")
@@ -157,9 +159,9 @@ class Main(app_ui.Main):
             self.npcs.setValue(max(2, result["selected"]["best_components"]))
 
             if result["suggested_label"]:
-                self.label.setText(result["suggested_label"])
+                self.label.setCurrentIndex(max(0, self.label.findData(result["suggested_label"])))
             if result["suggested_groups"]:
-                self.groups.setText(",".join(result["suggested_groups"]))
+                self.groups.set_columns(self.data[0].columns, result["suggested_groups"])
 
             self.render_guided()
             self.render_compare()
@@ -178,6 +180,7 @@ class Main(app_ui.Main):
         finally:
             self.auto_button.setEnabled(True)
 
+    @busy("Comparing preprocessing recipes")
     def run_compare(self):
         if self.data is None:
             app_ui.QMessageBox.information(self, "PCA Compare", "Load a dataset first.")
@@ -214,6 +217,7 @@ class Main(app_ui.Main):
         except Exception:
             self.err()
 
+    @busy("Calculating projection")
     def project(self):
         if self.data is None:
             return
@@ -245,6 +249,7 @@ class Main(app_ui.Main):
         except Exception:
             self.err()
 
+    @busy("Validating PCA")
     def run_cv(self):
         if self.data is None:
             return
@@ -254,7 +259,7 @@ class Main(app_ui.Main):
             X, constrained_wn, constraint = self._constrained(
                 spectra.to_numpy(), wn
             )
-            cols = [c.strip() for c in self.groups.text().split(",") if c.strip()]
+            cols = self.groups.selected_columns()
             groups = (
                 core.make_groups(meta, cols)
                 if cols and all(c in meta for c in cols)
@@ -289,6 +294,7 @@ class Main(app_ui.Main):
         except Exception:
             self.err()
 
+    @busy("Analyzing clusters")
     def run_cluster_analysis(self):
         if self.data is None:
             return
@@ -301,13 +307,14 @@ class Main(app_ui.Main):
         except Exception:
             self.err()
 
+    @busy("Tuning and validating models")
     def optimize(self):
         if self.data is None:
             return
         try:
             self.sync()
             meta, wn, spectra = self.data
-            label = self.label.text().strip()
+            label = (self.label.currentData() or "")
             if label not in meta:
                 raise ValueError("Choose a valid label column.")
 
@@ -316,10 +323,8 @@ class Main(app_ui.Main):
             X_full = spectra.loc[valid].to_numpy()
             X, constrained_wn, constraint = self._constrained(X_full, wn)
 
-            cols = [c.strip() for c in self.groups.text().split(",") if c.strip()]
-            eligibility_table, y, groups = core.eligibility(
-                filtered_meta, label, cols, self.minG.value()
-            )
+            cols = self.groups.selected_columns()
+            eligibility_table, y, groups = self.predictive_eligibility(filtered_meta, label)
             allowed = set(
                 eligibility_table.loc[eligibility_table.eligible, "class"]
             )
@@ -348,6 +353,7 @@ class Main(app_ui.Main):
                 outer,
                 self.inner.value(),
                 wn=constrained_wn,
+                validation_mode=self.validation_mode.currentData(),
             )
             self.opt = (result, X, y, groups)
             self.opt_wn = constrained_wn
@@ -361,6 +367,7 @@ class Main(app_ui.Main):
         except Exception:
             self.err()
 
+    @busy("Rebuilding trial preview")
     def replay_trial(self, index):
         if not hasattr(self, "trials_df") or self.trials_df.empty:
             return
@@ -410,17 +417,17 @@ class Main(app_ui.Main):
             self.hist.draw()
 
             self.trialplot.fig.clear()
-            colors = pd.Categorical(self.opt[2]).codes
+            colors = self.opt[2]
             if scores.shape[1] >= 3:
                 ax = self.trialplot.fig.add_subplot(projection="3d")
-                ax.scatter(
-                    scores[:, 0], scores[:, 1], scores[:, 2],
-                    c=colors, alpha=0.82
+                self.trialplot.scatter_samples(
+                    ax, scores[:, 0], scores[:, 1], scores[:, 2],
+                    labels=colors, alpha=0.82
                 )
                 ax.set_zlabel("View PC3")
             else:
                 ax = self.trialplot.fig.add_subplot()
-                ax.scatter(scores[:, 0], scores[:, 1], c=colors, alpha=0.82)
+                self.trialplot.scatter_samples(ax, scores[:, 0], scores[:, 1], labels=colors, alpha=0.82)
             ax.set_xlabel("View PC1")
             ax.set_ylabel("View PC2")
             ax.set_title(
