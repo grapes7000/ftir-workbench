@@ -9,10 +9,15 @@ import numpy as np
 import pandas as pd
 
 import core
+import pca_validation
 import transparent_guided
 from review_tools import install_gui_extensions, trial_projection
 from spectral_constraints import apply_hard_exclusion, describe_exclusion
 
+# Desktop analyses use the enhanced leakage-safe PCA CV implementation. It preserves
+# the existing signature while adding explained/cumulative variance, fold ranges,
+# and a true one-standard-error parsimony rule.
+core.pca_cv = pca_validation.pca_cv_enhanced
 core.compare_pca_recipes = transparent_guided.compare_pca_recipes
 core.guided_analysis = transparent_guided.guided_analysis
 
