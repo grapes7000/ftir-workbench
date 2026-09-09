@@ -40,7 +40,7 @@ The saturation and artifact checks are screening heuristics. They are deliberate
 
 ## PCA component selection
 
-PCA dimensionality is based on held-out reconstruction, not explained variance alone. The existing PCA CV computes RMSEC-X, RMSECV-X, RMSECV standard deviation, PRESS-X, and Q²-X. The selected model uses a one-standard-error-style parsimonious rule so a nearly flat validation curve does not automatically choose the absolute minimum RMSECV at a larger component count.
+PCA dimensionality is based on held-out reconstruction, not explained variance alone. The PCA CV computes RMSEC-X, RMSECV-X, RMSECV standard deviation, PRESS-X, and Q²-X. The selected model uses a one-standard-error-style parsimonious rule so a nearly flat validation curve does not automatically choose the absolute minimum RMSECV at a larger component count.
 
 ## Preprocessing stability
 
@@ -86,8 +86,11 @@ These screens are exploratory and do not substitute for a designed causal study.
 
 - stratified grouped **outer** folds for final generalization estimates
 - stratified grouped **inner** folds for preprocessing/model/hyperparameter selection
-- training-only fitting of imputation, centering/scaling, PCA, preprocessing state, and classifiers
+- training-only fitting of imputation, centering/scaling, PCA/PLS components, preprocessing state, and classifiers
 - real physical wavenumber axes in each preprocessing transformer
+- inner fold counts bounded by the smallest independent-group support in any class
+
+Inside each outer-training set, the inner search compares the explicit FTIR preprocessing candidates plus the current expert recipe when distinct. It simultaneously evaluates SVM, Random Forest, and PLS-DA settings. The outer test fold does not participate in this selection.
 
 The returned audit includes:
 
@@ -102,6 +105,7 @@ The returned audit includes:
 - outer-fold assignment per sample
 - sensitivity/recall and specificity by class
 - worst/best fold and fold-to-fold variability
+- selected model family and preprocessing recipe for each outer fold
 
 Training accuracy is not used as the primary predictive claim.
 
@@ -113,7 +117,7 @@ The supervised audit labels the training-to-outer balanced-accuracy gap as low, 
 
 `validation_audit.permutation_test_nested` provides an optional shuffled-label null test that reruns the nested grouped validation strategy. Permutation models are not optimized more aggressively than the observed model.
 
-Because this is computationally expensive, it is an optional validation tool rather than an automatic step on every dataset.
+Because this is computationally expensive, it is an optional validation tool rather than an automatic step on every dataset. The Model Health tab exposes a 10-permutation button.
 
 ## Exploratory versus predictive claims
 
@@ -124,6 +128,8 @@ The workbench must keep these statements separate:
 
 PCA separation, silhouette, or metadata association cannot establish the second statement.
 
-## Current algorithm scope
+## Supervised model families
 
-SVM and Random Forest remain the production supervised models in v5.2. The validation architecture is now modular enough to add a sklearn-compatible PLS-DA estimator without weakening the outer/inner validation boundary. PLS-DA should be added only with the same outer partitions and leakage safeguards used by the existing classifiers.
+SVM, Random Forest, and PLS-DA are available to the nested inner search. They are evaluated under the same grouped outer-validation procedure, and family selection is made inside each outer training fold rather than using the outer test data.
+
+The current Model Review comparison plot summarizes inner optimization trials. The final predictive claim remains the combined outer held-out prediction performance of the complete selection procedure, not the prettiest PCA plot or the highest training-score model.
